@@ -3,14 +3,12 @@ import tempfile
 import numpy as np
 import librosa
 import soundfile as sf
-from scipy.spatial.distance import cdist
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 app = FastAPI(title="Audio Aligner API")
 
-# Libera o acesso para o seu frontend (sem erro de CORS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,159 +17,178 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def find_vocal_onset(y: np.ndarray, sr: int, hop_length: int = 512, frame_len: int = 1024) -> float:
-    """
-    Detecta o instante exato (em segundos) em que o vocal realmente comeca a cantar,
-    ignorando ruidos de microfone, cliques, estalos ou respiracao inicial.
-    """
-    n_frames = (len(y) - frame_len) // hop_length + 1
-    if n_frames <= 0:
-        return 0.0
-    
-    rms = np.zeros(n_frames, dtype=np.float32)
-    for i in range(n_frames):
-        seg = y[i * hop_length : i * hop_length + frame_len]
-        rms[i] = np.sqrt(np.mean(seg**2))
-        
-    peak_rms = np.max(rms)
-    if peak_rms < 0.008:
-        return 0.0
-        
-    thresh = max(0.012, 0.06 * peak_rms)
-    min_sustained_frames = max(2, int(0.070 * sr / hop_length))
-    
-    for i in range(len(rms) - min_sustained_frames):
-        if np.all(rms[i : i + min_sustained_frames] > thresh):
-            onset_frame = i
-            while onset_frame > 0 and rms[onset_frame - 1] > 0.3 * thresh:
-                onset_frame -= 1
-            return max(0.0, onset_frame * hop_length / sr)
-            
-    return 0.0
-
-def extract_features(y: np.ndarray, sr: int, hop_length: int = 512):
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=hop_length)
-    mfcc_delta = librosa.feature.delta(mfcc)
-    chroma = librosa.feature.chroma_cens(y=y, sr=sr, hop_length=hop_length)
-    features = np.vstack([mfcc, mfcc_delta, chroma])
-    norm = np.linalg.norm(features, axis=0, keepdims=True) + 1e-8
-    return (features / norm).T
-
-def wsola_stretch(audio: np.ndarray, warp_map: np.ndarray, sr: int, target_len: int, hop_length: int = 512) -> np.ndarray:
-    n_samples = len(audio)
-    win_len = int(0.040 * sr)
-    hop_out = int(0.010 * sr)
-    win = np.hanning(win_len).astype(np.float32)
-    
-    out = np.zeros(target_len + win_len, dtype=np.float32)
-    norm = np.zeros(target_len + win_len, dtype=np.float32)
-    
-    t_out_axis = np.arange(0, target_len, hop_out)
-    ref_sample_axis = np.arange(len(warp_map)) * hop_length
-    interp_in_samples = np.interp(t_out_axis, ref_sample_axis, warp_map)
-    
-    for t_out, s_in in zip(t_out_axis, interp_in_samples):
-        src_pos = int(np.clip(s_in, 0, n_samples - win_len))
-        seg = audio[src_pos:src_pos + win_len]
-        if len(seg) < win_len:
-            continue
-        out[t_out:t_out + win_len] += seg * win
-        norm[t_out:t_out + win_len] += win
-        
-    mask = norm > 0.05
-    out[mask] /= norm[mask]
-    return out[:target_len]
-
 def align_audio_core(ref_path: str, vocal_path: str, target_sr: int = 22050) -> bytes:
+    """
+    Alinha o audio do cliente para ter o MESMO tempo total e sincronismo metrico
+    do audio de referencia da IA (Suno), respeitando estritamente o silencio inicial
+    e pausas instrumentais.
+    """
     y_ref, sr = librosa.load(ref_path, sr=target_sr, mono=True)
     y_voc, _ = librosa.load(vocal_path, sr=target_sr, mono=True)
     
-    hop_length = 512
+    hop_length = int(0.040 * sr)  # 40ms hop para sincronismo preciso e rapido
+    win_length = int(0.080 * sr)  # 80ms analise
     
-    # 1. Detecta o instante exato de entrada da voz da IA e da voz do cliente
-    t_ref_onset = find_vocal_onset(y_ref, sr, hop_length)
-    t_voc_onset = find_vocal_onset(y_voc, sr, hop_length)
+    # 1. Detecta o instante exato em que a voz da IA comeca a cantar no arranjo.
+    # Usa RMS sustentado com threshold relativo robusto contra bleed de bateria/instrumentos.
+    rms_ref = librosa.feature.rms(y=y_ref, hop_length=hop_length, frame_length=win_length)[0]
+    peak_ref_rms = float(np.max(rms_ref)) if len(rms_ref) > 0 else 0.0
+    ref_thresh = max(0.020, 0.15 * peak_ref_rms)
+    min_sustained = max(2, int(0.20 * sr / hop_length))  # minimo 200ms sustentado
     
-    ref_start_idx = int(t_ref_onset * sr)
-    voc_start_idx = int(t_voc_onset * sr)
-    
-    y_ref_active = y_ref[ref_start_idx:]
-    y_voc_active = y_voc[voc_start_idx:]
-    
-    # Fallback seguro caso um dos trechos ativos seja excessivamente curto
-    if len(y_ref_active) < 1.0 * sr or len(y_voc_active) < 1.0 * sr:
-        aligned_audio = np.zeros(len(y_ref), dtype=np.float32)
-        copy_len = min(len(y_voc_active), len(y_ref) - ref_start_idx)
-        if copy_len > 0:
-            aligned_audio[ref_start_idx : ref_start_idx + copy_len] = y_voc_active[:copy_len]
-        buffer = io.BytesIO()
-        sf.write(buffer, aligned_audio, sr, format="WAV", subtype="PCM_16")
-        buffer.seek(0)
-        return buffer.read()
-        
-    # 2. Extrai caracteristicas a partir do ponto de entrada do canto
-    feat_ref = extract_features(y_ref_active, sr, hop_length)
-    feat_voc = extract_features(y_voc_active, sr, hop_length)
-    
-    dist_matrix = cdist(feat_ref, feat_voc, metric="cosine")
-    
-    # 3. DTW com penalidade suave para sincronizar frases sem distorcoes bruscas
-    N, M = dist_matrix.shape
-    D = np.full((N, M), np.inf, dtype=np.float32)
-    D[0, 0] = dist_matrix[0, 0]
-    
-    for j in range(1, M):
-        D[0, j] = D[0, j-1] + dist_matrix[0, j] * 1.5
-    for i in range(1, N):
-        D[i, 0] = D[i-1, 0] + dist_matrix[i, 0] * 1.5
-        
-    for i in range(1, N):
-        for j in range(1, M):
-            c = dist_matrix[i, j]
-            d_diag = D[i-1, j-1] + c
-            d_horiz = D[i, j-1] + c * 1.2
-            d_vert = D[i-1, j] + c * 1.2
-            D[i, j] = min(d_diag, d_horiz, d_vert)
+    ref_onset_frame = 0
+    for i in range(len(rms_ref) - min_sustained):
+        if np.all(rms_ref[i : i + min_sustained] > ref_thresh):
+            ref_onset_frame = i
+            # Recua suavemente para o inicio do ataque/respiracao
+            while ref_onset_frame > 0 and rms_ref[ref_onset_frame - 1] > 0.4 * ref_thresh:
+                ref_onset_frame -= 1
+            break
             
-    # Backtrack a partir do final
-    i = N - 1
-    j = M - 1
-    path = [(i, j)]
-    while i > 0 or j > 0:
-        if i == 0:
-            j -= 1
-        elif j == 0:
-            i -= 1
-        else:
-            steps = [(i-1, j-1), (i, j-1), (i-1, j)]
-            costs = [D[s] for s in steps]
-            idx = np.argmin(costs)
-            i, j = steps[idx]
-        path.append((i, j))
+    t_ref_onset = ref_onset_frame * hop_length / sr
+    ref_start_idx = int(t_ref_onset * sr)
+    
+    # 2. Detecta o inicio e o fim do canto na gravacao do cliente (remove silencio inicial da gravacao)
+    rms_voc = librosa.feature.rms(y=y_voc, hop_length=hop_length, frame_length=win_length)[0]
+    peak_voc_rms = float(np.max(rms_voc)) if len(rms_voc) > 0 else 0.0
+    voc_thresh = max(0.015, 0.12 * peak_voc_rms)
+    
+    voc_onset_frame = 0
+    for i in range(len(rms_voc) - min_sustained):
+        if np.all(rms_voc[i : i + min_sustained] > voc_thresh):
+            voc_onset_frame = i
+            while voc_onset_frame > 0 and rms_voc[voc_onset_frame - 1] > 0.4 * voc_thresh:
+                voc_onset_frame -= 1
+            break
+            
+    voc_end_frame = len(rms_voc)
+    for i in range(len(rms_voc) - 1, voc_onset_frame, -1):
+        if rms_voc[i] > voc_thresh:
+            voc_end_frame = min(len(rms_voc), i + int(0.50 * sr / hop_length))
+            break
+            
+    voc_start_idx = int(voc_onset_frame * hop_length)
+    voc_end_idx = min(len(y_voc), int(voc_end_frame * hop_length))
+    
+    y_voc_active = y_voc[voc_start_idx : voc_end_idx]
+    y_ref_active = y_ref[ref_start_idx :]
+    
+    # Se algum trecho for nulo ou excessivamente curto, posiciona no ponto exato da entrada
+    if len(y_voc_active) < int(0.5 * sr) or len(y_ref_active) < int(0.5 * sr):
+        aligned_audio = np.zeros(len(y_ref), dtype=np.float32)
+        fit_len = min(len(y_voc), len(y_ref) - ref_start_idx)
+        if fit_len > 0:
+            aligned_audio[ref_start_idx : ref_start_idx + fit_len] = y_voc[:fit_len]
+        buf = io.BytesIO()
+        sf.write(buf, aligned_audio, sr, format="WAV", subtype="PCM_16")
+        buf.seek(0)
+        return buf.read()
         
-    path = np.array(path[::-1])
-    ref_frames, voc_frames = path[:, 0], path[:, 1]
-    unique_ref, idx = np.unique(ref_frames, return_index=True)
-    aligned_voc_frames = voc_frames[idx]
+    # 3. Extracao de caracteristicas (MFCCs para fonemas + Chroma STFT para melodia)
+    mfcc_ref = librosa.feature.mfcc(y=y_ref_active, sr=sr, n_mfcc=13, hop_length=hop_length)
+    chroma_ref = librosa.feature.chroma_stft(y=y_ref_active, sr=sr, hop_length=hop_length)
+    feat_ref = np.vstack([mfcc_ref, chroma_ref])
     
-    all_ref_frames = np.arange(N)
-    full_voc_frames = np.interp(all_ref_frames, unique_ref, aligned_voc_frames)
+    mfcc_voc = librosa.feature.mfcc(y=y_voc_active, sr=sr, n_mfcc=13, hop_length=hop_length)
+    chroma_voc = librosa.feature.chroma_stft(y=y_voc_active, sr=sr, hop_length=hop_length)
+    feat_voc = np.vstack([mfcc_voc, chroma_voc])
     
-    # Time-stretching do canto ativo
+    # DTW compilado e ultra-rapido (librosa numba)
+    try:
+        D, wp = librosa.sequence.dtw(X=feat_voc, Y=feat_ref, metric="cosine", backtrack=True)
+        wp = wp[::-1]  # ordem cronologica
+        voc_frames = wp[:, 0]
+        ref_frames = wp[:, 1]
+        
+        unique_ref, idx = np.unique(ref_frames, return_index=True)
+        aligned_voc_frames = voc_frames[idx]
+        
+        all_ref_frames = np.arange(feat_ref.shape[1])
+        full_voc_frames = np.interp(all_ref_frames, unique_ref, aligned_voc_frames)
+    except Exception:
+        # Fallback linear suave caso DTW falhe
+        all_ref_frames = np.arange(feat_ref.shape[1])
+        full_voc_frames = np.linspace(0, feat_voc.shape[1] - 1, len(all_ref_frames))
+        
+    # 4. Time-Stretching WSOLA para sincronizar metricamente sem alterar o tom (pitch)
+    Hs = int(0.020 * sr)  # salto de sintese de 20ms
+    N = Hs * 2           # janela de 40ms
+    tol = int(0.012 * sr) # faixa de correlacao de forma de onda
+    D_dec = 4
+    
+    n_voc_samples = len(y_voc_active)
+    target_active_len = len(y_ref_active)
+    
+    nd = n_voc_samples // D_dec
+    L = Hs // D_dec
+    mono_voc = y_voc_active[::D_dec][:nd].astype(np.float32)
+    win = (0.5 - 0.5 * np.cos(2 * np.pi * np.arange(N) / N)).astype(np.float32)
+    
+    stretched_active = np.zeros(target_active_len + 3 * N, dtype=np.float32)
+    norm = np.zeros(target_active_len + 3 * N, dtype=np.float32)
+    
     warp_sample_map = full_voc_frames * hop_length
-    stretched_active = wsola_stretch(y_voc_active, warp_sample_map, sr, target_len=len(y_ref_active), hop_length=hop_length)
+    ref_sample_axis = all_ref_frames * hop_length
+    last_frame = int(np.ceil(target_active_len / Hs))
+    prev_start = 0
+    have_prev = False
     
-    # 4. Monta a faixa completa: silencio durante a intro instrumental,
-    # e a voz do cliente entra exatamente no mesmo milissegundo da voz da IA
+    for k in range(-1, last_frame + 1):
+        p = k * Hs
+        s_in = float(np.interp(p + Hs, ref_sample_axis, warp_sample_map))
+        if s_in < 0 or s_in >= n_voc_samples:
+            have_prev = False
+            continue
+            
+        target = int(round(s_in)) - Hs
+        start = target
+        
+        if have_prev:
+            tpl = int(round((prev_start + Hs) / D_dec))
+            if 0 <= tpl and tpl + L <= nd:
+                tpl_seg = mono_voc[tpl : tpl + L]
+                tpl_e = float(np.sum(tpl_seg**2)) + 1e-9
+                lo = max(0, int(round((target - tol) / D_dec)))
+                hi = min(nd - L, int(round((target + tol) / D_dec)))
+                best_score = -1e9
+                best_sd = -1
+                for sd in range(lo, hi + 1):
+                    cand = mono_voc[sd : sd + L]
+                    dot = float(np.sum(tpl_seg * cand))
+                    e = float(np.sum(cand**2)) + 1e-9
+                    score = dot / np.sqrt(e * tpl_e) - (0.02 * abs(sd * D_dec - target)) / tol
+                    if score > best_score:
+                        best_score = score
+                        best_sd = sd
+                if best_sd >= 0:
+                    start = best_sd * D_dec
+                    
+        for m in range(N):
+            o = p + m
+            idx_s = start + m
+            if 0 <= o < len(stretched_active) and 0 <= idx_s < n_voc_samples:
+                stretched_active[o] += win[m] * y_voc_active[idx_s]
+                norm[o] += win[m]
+                
+        prev_start = start
+        have_prev = True
+        
+    mask = norm > 0.05
+    stretched_active[mask] /= norm[mask]
+    stretched_active = stretched_active[:target_active_len]
+    
+    # 5. Montagem da faixa final com a EXATA mesma duracao da referencia
+    # [0 : ref_start_idx] e puro silencio (zeros)
+    # [ref_start_idx : ] e a voz do cliente cantando no tempo exato
     aligned_audio = np.zeros(len(y_ref), dtype=np.float32)
     fit_len = min(len(stretched_active), len(y_ref) - ref_start_idx)
     if fit_len > 0:
         aligned_audio[ref_start_idx : ref_start_idx + fit_len] = stretched_active[:fit_len]
         
-    buffer = io.BytesIO()
-    sf.write(buffer, aligned_audio, sr, format="WAV", subtype="PCM_16")
-    buffer.seek(0)
-    return buffer.read()
+    buf = io.BytesIO()
+    sf.write(buf, aligned_audio, sr, format="WAV", subtype="PCM_16")
+    buf.seek(0)
+    return buf.read()
 
 @app.get("/")
 def health_check():
@@ -186,13 +203,14 @@ def align_endpoint(
         ref_bytes = audio_referencia.file.read()
         voc_bytes = audio_cliente.file.read()
         
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_ref,              tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_voc:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_ref, \
+             tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_voc:
             f_ref.write(ref_bytes)
             f_voc.write(voc_bytes)
             ref_path = f_ref.name
-            voc_path = f_voc.name
+            vocal_path = f_voc.name
         
-        aligned_wav_bytes = align_audio_core(ref_path, voc_path)
+        aligned_wav_bytes = align_audio_core(ref_path, vocal_path)
         
         return StreamingResponse(
             io.BytesIO(aligned_wav_bytes),
