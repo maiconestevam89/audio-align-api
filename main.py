@@ -27,17 +27,18 @@ def extract_features(y: np.ndarray, sr: int, hop_length: int = 512):
     norm = np.linalg.norm(features, axis=0, keepdims=True) + 1e-8
     return (features / norm).T
 
-def wsola_stretch(audio: np.ndarray, warp_map: np.ndarray, sr: int, target_len: int) -> np.ndarray:
+def wsola_stretch(audio: np.ndarray, warp_map: np.ndarray, sr: int, target_len: int, hop_length: int = 512) -> np.ndarray:
     n_samples = len(audio)
     win_len = int(0.040 * sr)
-    hop_out = int(0.020 * sr)
-    win = np.hanning(win_len)
+    hop_out = int(0.010 * sr)
+    win = np.hanning(win_len).astype(np.float32)
     
     out = np.zeros(target_len + win_len, dtype=np.float32)
     norm = np.zeros(target_len + win_len, dtype=np.float32)
     
     t_out_axis = np.arange(0, target_len, hop_out)
-    interp_in_samples = np.interp(t_out_axis, np.arange(len(warp_map)), warp_map)
+    ref_sample_axis = np.arange(len(warp_map)) * hop_length
+    interp_in_samples = np.interp(t_out_axis, ref_sample_axis, warp_map)
     
     for t_out, s_in in zip(t_out_axis, interp_in_samples):
         src_pos = int(np.clip(s_in, 0, n_samples - win_len))
@@ -45,9 +46,9 @@ def wsola_stretch(audio: np.ndarray, warp_map: np.ndarray, sr: int, target_len: 
         if len(seg) < win_len:
             continue
         out[t_out:t_out + win_len] += seg * win
-        norm[t_out:t_out + win_len] += win ** 2
+        norm[t_out:t_out + win_len] += win
         
-    mask = norm > 1e-4
+    mask = norm > 0.05
     out[mask] /= norm[mask]
     return out[:target_len]
 
@@ -72,7 +73,7 @@ def align_audio_core(ref_path: str, vocal_path: str, target_sr: int = 22050) -> 
     full_voc_frames = np.interp(all_ref_frames, unique_ref, aligned_voc_frames)
     
     warp_sample_map = full_voc_frames * hop_length
-    aligned_audio = wsola_stretch(y_voc, warp_sample_map, sr, target_len=len(y_ref))
+    aligned_audio = wsola_stretch(y_voc, warp_sample_map, sr, target_len=len(y_ref), hop_length=hop_length)
     
     buffer = io.BytesIO()
     sf.write(buffer, aligned_audio, sr, format="WAV", subtype="PCM_16")
@@ -84,15 +85,17 @@ def health_check():
     return {"status": "ok", "service": "Audio Aligner API"}
 
 @app.post("/align")
-async def align_endpoint(
+def align_endpoint(
     audio_referencia: UploadFile = File(...),
     audio_cliente: UploadFile = File(...)
 ):
     try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_ref, \
-             tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_voc:
-            f_ref.write(await audio_referencia.read())
-            f_voc.write(await audio_cliente.read())
+        ref_bytes = audio_referencia.file.read()
+        voc_bytes = audio_cliente.file.read()
+        
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_ref,              tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_voc:
+            f_ref.write(ref_bytes)
+            f_voc.write(voc_bytes)
             ref_path = f_ref.name
             voc_path = f_voc.name
         
